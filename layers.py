@@ -369,13 +369,13 @@ def infill_background(
     elif method == "lama":
         from simple_lama_inpainting import SimpleLama  # type: ignore
         global _LAMA
-        try:
-            _LAMA  # type: ignore
-        except NameError:
-            _LAMA = SimpleLama()  # type: ignore
+        if _LAMA is None:
+            _LAMA = SimpleLama()
         mask_pil = Image.fromarray((hole_mask.astype(np.uint8)) * 255, mode="L")
         src_pil = Image.fromarray(rgb, mode="RGB")
         filled = _LAMA(src_pil, mask_pil)
+        if filled.size != src_pil.size:
+            filled = filled.resize(src_pil.size, Image.Resampling.BICUBIC)
         return np.asarray(filled.convert("RGB"))
     else:
         raise ValueError(f"unknown infill method {method!r}")
@@ -431,7 +431,7 @@ def run_depth(img: Image.Image, device: str) -> Optional[Image.Image]:
     depth = result.get("depth") if isinstance(result, dict) else result[0]["depth"]
     if not isinstance(depth, Image.Image):
         depth = Image.fromarray(np.asarray(depth))
-    depth = depth.convert("L").resize(img.size, Image.BICUBIC)
+    depth = depth.convert("L").resize(img.size, Image.Resampling.BICUBIC)
     return depth
 
 
