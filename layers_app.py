@@ -925,7 +925,8 @@ def build_ui(args):
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row():
                         model = gr.Dropdown(
-                            ["sam2-hiera-large", "sam2-hiera-base-plus",
+                            ["facebook/sam3",
+                             "sam2-hiera-large", "sam2-hiera-base-plus",
                              "sam2-hiera-small", "sam2-hiera-tiny"],
                             value=args.model, label="Model",
                         )
@@ -1005,9 +1006,9 @@ def build_ui(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="sam2-hiera-large")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--model", default="sam2-hiera-large")  # or "facebook/sam3"
     args = ap.parse_args()
     demo = build_ui(args)
     demo.launch(server_name="127.0.0.1", server_port=args.port, inbrowser=True)

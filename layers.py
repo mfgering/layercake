@@ -99,15 +99,124 @@ def bool_mask_to_sam2_prior(mask: np.ndarray, strength: float = 5.0) -> np.ndarr
     logits = np.where(resized > 0.5, strength, -strength).astype(np.float32)
     return logits[None, ...]  # shape (1, 256, 256)
 
+class Sam3TrackerPredictor:
+    """
+    Adapter exposing the SAM2ImagePredictor surface (.set_image / .predict /
+    .device) on top of transformers' Sam3TrackerModel. Lets layercake swap
+    SAM 2 -> SAM 3 (Tracker / PVS) with zero changes to segment_layer or the app.
+
+    Supported predict() kwargs mirror what layercake actually uses:
+      point_coords (N,2), point_labels (N,), box (4,), mask_input (1,256,256),
+      multimask_output (bool), return_logits (bool).
+    Returns (masks, scores, low_res_logits-or-None) like SAM 2.
+    """
+
+    def __init__(self, model, processor, device: str):
+        self.model = model
+        self.processor = processor
+        self.device = device
+        self._image = None              # PIL image for the current frame
+        self._orig_size = None          # (H, W)
+        self._image_embeddings = None   # cached encoder output
+
+    def set_image(self, rgb: np.ndarray):
+        import torch
+        self._image = Image.fromarray(rgb, mode="RGB")
+        self._orig_size = (rgb.shape[0], rgb.shape[1])
+        # Pre-compute vision features once per image (the expensive step).
+        inputs = self.processor(images=self._image, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            self._image_embeddings = self.model.get_image_embeddings(inputs["pixel_values"])
+
+
+    def predict(
+        self,
+        point_coords: Optional[np.ndarray] = None,
+        point_labels: Optional[np.ndarray] = None,
+        box: Optional[np.ndarray] = None,
+        mask_input: Optional[np.ndarray] = None,
+        multimask_output: bool = True,
+        return_logits: bool = False,
+    ):
+        import torch
+        if self._image is None:
+            raise RuntimeError("set_image() must be called before predict().")
+
+        # SAM2 layout: point_coords (N,2), point_labels (N,)
+        # SAM3Tracker layout: input_points  (img, obj, pts_per_obj, 2)
+        #                     input_labels  (img, obj, pts_per_obj)
+        input_points = input_labels = input_boxes = None
+        if point_coords is not None and len(point_coords) > 0:
+            input_points = [[[[float(x), float(y)] for x, y in point_coords]]]
+            if point_labels is None:
+                point_labels = np.ones(len(point_coords), dtype=np.int32)
+            input_labels = [[[int(v) for v in point_labels]]]
+        if box is not None:
+            x1, y1, x2, y2 = (float(v) for v in box)
+            input_boxes = [[[x1, y1, x2, y2]]]
+
+        proc_kwargs = dict(return_tensors="pt", original_sizes=[list(self._orig_size)])
+        if input_points is not None:
+            proc_kwargs.update(input_points=input_points, input_labels=input_labels)
+        if input_boxes is not None:
+            proc_kwargs["input_boxes"] = input_boxes
+        inputs = self.processor(**proc_kwargs).to(self.device)
+
+        # logit-space mask prior (1,256,256) -> tensor; reuse SAM3's prompt encoder
+        input_masks = None
+        if mask_input is not None:
+            input_masks = torch.as_tensor(mask_input, dtype=torch.float32, device=self.device)
+
+        fwd = {k: v for k, v in inputs.items() if k != "pixel_values"}
+        with torch.no_grad():
+            outputs = self.model(
+                **fwd,
+                input_masks=input_masks,
+                image_embeddings=self._image_embeddings,
+                multimask_output=multimask_output,
+            )
+
+        # pred_masks: (batch, point_batch, num_masks, h, w). Upscale to source dims.
+        masks = self.processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"],
+            binarize=not return_logits,
+        )[0]  # -> (num_masks, H, W) for our single image/object
+
+        # Collapse leading object dim if present, to match SAM2's (N, H, W).
+        masks_np = masks.numpy() if hasattr(masks, "numpy") else np.asarray(masks)
+        if masks_np.ndim == 4:        # (obj, num_masks, H, W) -> (num_masks, H, W)
+            masks_np = masks_np[0]
+        scores = outputs.iou_scores.squeeze().detach().cpu().numpy().reshape(-1)
+
+        if return_logits:
+            return masks_np.astype(np.float32), scores, None
+        return masks_np.astype(bool), scores, None
+
+def load_sam3_tracker_predictor(model: str, device: str):
+    """Load the SAM 3 Tracker (PVS) predictor behind the SAM2ImagePredictor API."""
+    from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+    import os
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    hf_id = model if "/" in model else f"facebook/{model}"
+    try:
+        m = Sam3TrackerModel.from_pretrained(hf_id, token=token).to(device)
+        proc = Sam3TrackerProcessor.from_pretrained(hf_id, token=token)
+    except Exception as e:
+        msg = str(e)
+        if any(s in msg.lower() for s in ("gated", "401", "403", "access")):
+            raise RuntimeError(f"{msg}\n\n{SAM3_AUTH_HINT}") from e
+        raise
+    return Sam3TrackerPredictor(m, proc, device)
 
 def load_sam2_predictor(model: str, device: str):
-    """Load SAM 2 image predictor. Weights auto-download from HF on first run."""
+    """Load an image predictor. Routes sam3* ids to the SAM 3 Tracker adapter,
+    otherwise loads SAM 2. Name kept for backward compat with the app."""
+    if "sam3" in model.lower():
+        return load_sam3_tracker_predictor(model, device)
     from sam2.sam2_image_predictor import SAM2ImagePredictor
-
     hf_id = model if "/" in model else f"facebook/{model}"
-    predictor = SAM2ImagePredictor.from_pretrained(hf_id, device=device)
-    return predictor
-
+    return SAM2ImagePredictor.from_pretrained(hf_id, device=device)
 
 # --- SAM 3 concept-segmentation path ---------------------------------------
 #
@@ -277,7 +386,7 @@ def segment_layer(
     m = np.asarray(masks[best])
     if m.shape != (H, W):
         raise RuntimeError(
-            f"SAM 2 returned mask {m.shape}, expected ({H}, {W}). "
+            f"predicter returned mask. "
             "Check that the predictor was set on the correct image."
         )
     if return_soft:
@@ -509,8 +618,6 @@ def main() -> int:
                     help="JSON string or path to JSON file. List of {name, points, labels?}. "
                          "Order = depth order (first = nearest).")
     ap.add_argument("--out", required=True, help="output directory")
-    ap.add_argument("--model", default="sam2-hiera-large",
-                    help="SAM 2 model id. Default: sam2-hiera-large (HF: facebook/sam2-hiera-large)")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     ap.add_argument("--feather", type=int, default=2, help="Gaussian feather radius (px) for --edges feather")
     ap.add_argument("--edges", default="feather", choices=["feather", "sam-soft", "matting"],
@@ -528,6 +635,9 @@ def main() -> int:
                     help="fill the bg hole (where foreground layers sit) with plausible content. "
                          "opencv = Navier-Stokes (instant, simple bgs). lama = LaMa model (better, ~200MB). "
                          "When set, bg.png is opaque everywhere and contains the infilled backdrop.")
+    ap.add_argument("--model", default="sam2-hiera-large",
+                    help="Segmentation model id. SAM 2: sam2-hiera-{large,base-plus,"
+                         "small,tiny}. SAM 3 (better, gated): facebook/sam3.")
     args = ap.parse_args()
 
     src_path = Path(args.image).expanduser()
